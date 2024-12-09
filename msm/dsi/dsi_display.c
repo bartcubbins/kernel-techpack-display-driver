@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/list.h>
@@ -36,6 +37,12 @@
 
 #define SEC_PANEL_NAME_MAX_LEN  256
 
+#define TMP_BUF_SZ 128
+#define MAX_WRITE_DATA 100
+
+static char *res_buf;
+static int buf_sz;
+
 u8 dbgfs_tx_cmd_buf[SZ_4K];
 static char dsi_display_primary[MAX_CMDLINE_PARAM_LEN];
 static char dsi_display_secondary[MAX_CMDLINE_PARAM_LEN];
@@ -48,6 +55,8 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{.compatible = "qcom,dsi-display"},
 	{}
 };
+
+struct device virtdev;
 
 bool is_skip_op_required(struct dsi_display *display)
 {
@@ -258,7 +267,8 @@ error:
 	return rc;
 }
 
-static int dsi_display_cmd_engine_enable(struct dsi_display *display)
+//static int dsi_display_cmd_engine_enable(struct dsi_display *display)
+int dsi_display_cmd_engine_enable(struct dsi_display *display)
 {
 	int rc = 0;
 	int i;
@@ -306,7 +316,8 @@ done:
 	return rc;
 }
 
-static int dsi_display_cmd_engine_disable(struct dsi_display *display)
+//static int dsi_display_cmd_engine_disable(struct dsi_display *display)
+int dsi_display_cmd_engine_disable(struct dsi_display *display)
 {
 	int rc = 0;
 	int i;
@@ -594,9 +605,6 @@ static bool dsi_display_validate_reg_read(struct dsi_panel *panel)
 
 	for (i = 0; i < count; i++)
 		len += lenp[i];
-
-	for (i = 0; i < len; i++)
-		j += len;
 
 	for (j = 0; j < config->groups; ++j) {
 		for (i = 0; i < len; ++i) {
@@ -887,16 +895,17 @@ int dsi_display_check_status(struct drm_connector *connector, void *display,
 		panel->esd_config.esd_enabled = false;
 	}
 
-	if (rc <= 0 && te_check_override)
+	/*
+	 * TE check may fail even if status read is passing. In case of
+	 * te_check_override, check the status both from reg read and TE.
+	 */
+	if (rc > 0 && te_check_override)
 		rc = dsi_display_status_check_te(dsi_display, te_rechecks);
 	/* Unmask error interrupts if check passed*/
 	if (rc > 0) {
 		dsi_display_set_ctrl_esd_check_flag(dsi_display, false);
 		dsi_display_mask_ctrl_error_interrupts(dsi_display, mask,
 							false);
-		if (te_check_override && panel->esd_config.esd_enabled == false)
-			rc = dsi_display_status_check_te(dsi_display,
-					te_rechecks);
 	}
 
 	dsi_display_clk_ctrl(dsi_display->dsi_clk_handle,
@@ -1028,6 +1037,7 @@ int dsi_display_cmd_transfer(struct drm_connector *connector,
 		return -EINVAL;
 	}
 
+	SDE_EVT32(dsi_display->tx_cmd_buf_ndx, cmd_buf_len);
 	DSI_DEBUG("[DSI] Display command transfer\n");
 
 	if ((cmd_buf[1]) || (cmd_buf[3] & MIPI_DSI_MSG_LASTCOMMAND))
@@ -1152,6 +1162,8 @@ int dsi_display_cmd_receive(void *display, const char *cmd_buf,
 		return -EINVAL;
 	}
 
+	SDE_EVT32(cmd_buf_len, recv_buf_len);
+
 	rc = dsi_display_cmd_prepare(cmd_buf, cmd_buf_len,
 			&cmd, cmd_payload, MAX_CMD_PAYLOAD_SIZE);
 	if (rc) {
@@ -1247,12 +1259,22 @@ int dsi_display_set_power(struct drm_connector *connector,
 
 	switch (power_mode) {
 	case SDE_MODE_DPMS_LP1:
+		if (display->panel->power_mode == SDE_MODE_DPMS_LP2) {
+			if (dsi_display_set_ulp_load(display, false) < 0)
+				DSI_WARN("failed to set load for lp1 state\n");
+		}
 		rc = dsi_panel_set_lp1(display->panel);
 		break;
 	case SDE_MODE_DPMS_LP2:
 		rc = dsi_panel_set_lp2(display->panel);
+		if (dsi_display_set_ulp_load(display, true) < 0)
+			DSI_WARN("failed to set load for lp2 state\n");
 		break;
 	case SDE_MODE_DPMS_ON:
+		if (display->panel->power_mode == SDE_MODE_DPMS_LP2) {
+			if (dsi_display_set_ulp_load(display, false) < 0)
+				DSI_WARN("failed to set load for on state\n");
+		}
 		if ((display->panel->power_mode == SDE_MODE_DPMS_LP1) ||
 			(display->panel->power_mode == SDE_MODE_DPMS_LP2))
 			rc = dsi_panel_set_nolp(display->panel);
@@ -1562,7 +1584,7 @@ static ssize_t debugfs_esd_trigger_check(struct file *file,
 						display->trusted_vm_env);
 		if (rc) {
 			DSI_ERR("Failed to trigger ESD attack\n");
-			goto error;
+			goto unlock;
 		}
 	}
 
@@ -2443,6 +2465,63 @@ void dsi_display_enable_event(struct drm_connector *connector,
 	}
 }
 
+int dsi_display_ctrl_vreg_on(struct dsi_display *display)
+{
+	int rc = 0;
+	int i;
+	struct dsi_display_ctrl *ctrl;
+	struct dsi_ctrl *dsi_ctrl;
+
+	display_for_each_ctrl(i, display) {
+		ctrl = &display->ctrl[i];
+		if (!ctrl->ctrl)
+			continue;
+
+		dsi_ctrl = ctrl->ctrl;
+		if (dsi_ctrl->current_state.host_initialized) {
+			rc = dsi_pwr_enable_regulator(
+					&dsi_ctrl->pwr_info.host_pwr, true);
+			if (rc) {
+				DSI_ERR("[%s] Failed to enable vreg, rc=%d\n",
+				       dsi_ctrl->name, rc);
+				goto error;
+			}
+			DSI_DEBUG("[%s] Enable ctrl vreg\n", dsi_ctrl->name);
+		}
+	}
+error:
+	return rc;
+}
+
+int dsi_display_ctrl_vreg_off(struct dsi_display *display)
+{
+	int rc = 0;
+	int i;
+	struct dsi_display_ctrl *ctrl;
+	struct dsi_ctrl *dsi_ctrl;
+
+	display_for_each_ctrl(i, display) {
+		ctrl = &display->ctrl[i];
+		if (!ctrl->ctrl)
+			continue;
+
+		dsi_ctrl = ctrl->ctrl;
+		if (dsi_ctrl->current_state.host_initialized) {
+			rc = dsi_pwr_enable_regulator(
+				&dsi_ctrl->pwr_info.host_pwr, false);
+			if (rc) {
+				DSI_ERR("[%s] Failed to disable vreg, rc=%d\n",
+				       dsi_ctrl->name, rc);
+				goto error;
+			}
+			DSI_DEBUG("[%s] Disable ctrl vreg\n", dsi_ctrl->name);
+		}
+	}
+error:
+	return rc;
+}
+
+
 static int dsi_display_ctrl_power_on(struct dsi_display *display)
 {
 	int rc = 0;
@@ -2574,7 +2653,7 @@ static int dsi_display_parse_boot_display_selection(void)
 		strlcpy(disp_buf, boot_displays[i].boot_param,
 			MAX_CMDLINE_PARAM_LEN);
 
-		pos = strnstr(disp_buf, ":", MAX_CMDLINE_PARAM_LEN);
+		pos = strnstr(disp_buf, ":", strlen(disp_buf));
 
 		/* Use ':' as a delimiter to retrieve the display name */
 		if (!pos) {
@@ -2647,7 +2726,39 @@ error:
 	return rc;
 }
 
-static int dsi_display_set_clk_src(struct dsi_display *display)
+#ifdef CONFIG_DEEPSLEEP
+int dsi_display_unset_clk_src(struct dsi_display *display)
+{
+	int rc = 0;
+	int i;
+	struct dsi_display_ctrl *ctrl;
+
+	DSI_DEBUG("[%s] unset source clocks\n", display->name);
+
+	display_for_each_ctrl(i, display) {
+		ctrl = &display->ctrl[i];
+		if (!ctrl->ctrl)
+			continue;
+
+		/* set ctrl clocks to xo source */
+		rc = dsi_ctrl_set_clock_source(ctrl->ctrl,
+			   &display->clock_info.xo_clks);
+		if (rc) {
+			DSI_ERR("[%s] failed to set source clocks, rc=%d\n",
+				   display->name, rc);
+			return rc;
+		}
+	}
+	return 0;
+}
+#else
+inline int dsi_display_unset_clk_src(struct dsi_display *display)
+{
+	return 0;
+}
+#endif
+
+int dsi_display_set_clk_src(struct dsi_display *display)
 {
 	int rc = 0;
 	int i;
@@ -3297,7 +3408,7 @@ static ssize_t dsi_host_transfer(struct mipi_dsi_host *host,
 
 		rc = dsi_ctrl_cmd_transfer(display->ctrl[ctrl_idx].ctrl, msg,
 				&cmd_flags);
-		if (rc) {
+		if (rc < 0) {
 			DSI_ERR("[%s] cmd transfer failed, rc=%d\n",
 			       display->name, rc);
 			goto error_disable_cmd_engine;
@@ -3432,6 +3543,7 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 {
 	int i, rc = 0, num_clk = 0;
 	const char *clk_name;
+	const char *xo_byte = "xo_byte", *xo_pixel = "xo_pixel";
 	const char *src_byte = "src_byte", *src_pixel = "src_pixel";
 	const char *mux_byte = "mux_byte", *mux_pixel = "mux_pixel";
 	const char *cphy_byte = "cphy_byte", *cphy_pixel = "cphy_pixel";
@@ -3439,6 +3551,7 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 	const char *shadow_cphybyte = "shadow_cphybyte",
 		   *shadow_cphypixel = "shadow_cphypixel";
 	struct clk *dsi_clk;
+	struct dsi_clk_link_set *xo = &display->clock_info.xo_clks;
 	struct dsi_clk_link_set *src = &display->clock_info.src_clks;
 	struct dsi_clk_link_set *mux = &display->clock_info.mux_clks;
 	struct dsi_clk_link_set *cphy = &display->clock_info.cphy_clks;
@@ -3468,6 +3581,15 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 			rc = PTR_ERR(dsi_clk);
 
 			DSI_ERR("failed to get %s, rc=%d\n", clk_name, rc);
+
+			if (dsi_display_check_prefix(xo_byte, clk_name)) {
+				xo->byte_clk = NULL;
+				goto error;
+			}
+			if (dsi_display_check_prefix(xo_pixel, clk_name)) {
+				xo->pixel_clk = NULL;
+				goto error;
+			}
 
 			if (dsi_display_check_prefix(mux_byte, clk_name)) {
 				mux->byte_clk = NULL;
@@ -3512,6 +3634,16 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 
 				dyn_clk_caps->dyn_clk_support = false;
 			}
+		}
+
+		if (dsi_display_check_prefix(xo_byte, clk_name)) {
+			xo->byte_clk = dsi_clk;
+			continue;
+		}
+
+		if (dsi_display_check_prefix(xo_pixel, clk_name)) {
+			xo->pixel_clk = dsi_clk;
+			continue;
 		}
 
 		if (dsi_display_check_prefix(src_byte, clk_name)) {
@@ -3904,6 +4036,35 @@ int dsi_pre_clkon_cb(void *priv,
 	return rc;
 }
 
+int dsi_display_set_ulp_load(struct dsi_display *display, bool enable)
+{
+	int i, rc = 0;
+	struct dsi_display_ctrl *display_ctrl;
+	struct dsi_ctrl *ctrl;
+	struct dsi_panel *panel;
+
+	display_for_each_ctrl(i, display) {
+		display_ctrl = &display->ctrl[i];
+		if (!display_ctrl->ctrl)
+			continue;
+		ctrl = display_ctrl->ctrl;
+
+		rc = dsi_pwr_config_vreg_opt_mode(&ctrl->pwr_info.host_pwr, enable);
+		if (rc) {
+			DSI_ERR("failed to set ctrl load\n");
+			return rc;
+		}
+	}
+
+	panel = display->panel;
+	rc = dsi_pwr_config_vreg_opt_mode(&panel->power_info, enable);
+	if (rc) {
+		DSI_ERR("failed to set panel load\n");
+		return rc;
+	}
+	return rc;
+}
+
 static void __set_lane_map_v2(u8 *lane_map_v2,
 	enum dsi_phy_data_lanes lane0,
 	enum dsi_phy_data_lanes lane1,
@@ -4107,6 +4268,12 @@ static int dsi_display_parse_dt(struct dsi_display *display)
 	/* Parse TE data */
 	dsi_display_parse_te_data(display);
 
+	display->needs_clk_src_reset = of_property_read_bool(of_node,
+				"qcom,needs-clk-src-reset");
+
+	display->needs_ctrl_vreg_disable = of_property_read_bool(of_node,
+				"qcom,needs-ctrl-vreg-disable");
+
 	/* Parse all external bridges from port 0 */
 	display_for_each_ctrl(i, display) {
 		display->ext_bridge[i].node_of =
@@ -4120,6 +4287,90 @@ static int dsi_display_parse_dt(struct dsi_display *display)
 	DSI_DEBUG("success\n");
 error:
 	return rc;
+}
+
+static irqreturn_t dsi_panel_driver_oled_short_det_handler(int irq, void *dev)
+{
+	struct dsi_display *display = (struct dsi_display *)dev;
+	struct short_detection_ctrl *short_det = NULL;
+
+	if (dev == NULL) {
+		DSI_ERR("%s: Invalid parameter\n", __func__);
+		return IRQ_HANDLED;
+	}
+	short_det = &display->panel->spec_pdata->short_det;
+
+	if (short_det == NULL) {
+		DSI_ERR("%s: NULL pointer detected\n", __func__);
+		return IRQ_HANDLED;
+	}
+
+	DSI_ERR("%s: VREG_NG interrupt!\n", __func__);
+
+	if (gpio_get_value(display->panel->spec_pdata->disp_err_fg_gpio) == 1)
+		DSI_ERR("%s: VREG NG!!!\n", __func__);
+	else
+		return IRQ_HANDLED;
+
+	if (short_det->short_check_working) {
+		DSI_DEBUG("%s already being check work.\n", __func__);
+		return IRQ_HANDLED;
+	}
+
+	short_det->current_chatter_cnt = SHORT_CHATTER_CNT_START;
+
+	schedule_delayed_work(&short_det->check_work,
+		msecs_to_jiffies(short_det->target_chatter_check_interval));
+
+	return IRQ_HANDLED;
+}
+
+void dsi_panel_driver_oled_short_det_init_works(struct dsi_display *display)
+{
+	struct short_detection_ctrl *short_det = NULL;
+	int rc = 0;
+
+	if (display == NULL) {
+		DSI_ERR("%s: Invalid parameter\n", __func__);
+		return;
+	}
+	short_det = &display->panel->spec_pdata->short_det;
+
+	INIT_DELAYED_WORK(&short_det->check_work,
+				dsi_panel_driver_oled_short_check_worker);
+
+	short_det->current_chatter_cnt = 0;
+	short_det->short_check_working = false;
+	short_det->target_chatter_check_interval =
+				SHORT_DEFAULT_TARGET_CHATTER_INTERVAL;
+
+	if (!gpio_is_valid(display->panel->spec_pdata->disp_err_fg_gpio)) {
+		DSI_ERR("%s: disp error flag gpio is invalid\n", __func__);
+		return;
+	}
+	short_det->irq_num = gpio_to_irq(display->panel->spec_pdata->disp_err_fg_gpio);
+
+	rc = request_irq(short_det->irq_num,
+			dsi_panel_driver_oled_short_det_handler,
+			SHORT_IRQF_FLAGS, "disp_err_fg_gpio", display);
+	if (rc < 0) {
+		DSI_ERR("Failed to irq request rc=%d\n", rc);
+		return;
+	}
+
+	dsi_panel_driver_oled_short_det_disable(display->panel->spec_pdata);
+	if (display->boot_disp->boot_disp_en)
+		dsi_panel_driver_oled_short_det_enable(
+			display->panel->spec_pdata, SHORT_WORKER_PASSIVE);
+
+	//For error flag already rised in xboot case
+	if(gpio_get_value(display->panel->spec_pdata->disp_err_fg_gpio)) {
+		DSI_ERR("%s: Error Flag Detected\n", __func__);
+		short_det->current_chatter_cnt = SHORT_CHATTER_CNT_START;
+		schedule_delayed_work(&short_det->check_work,
+			msecs_to_jiffies(short_det->target_chatter_check_interval));
+	}
+
 }
 
 static int dsi_display_res_init(struct dsi_display *display)
@@ -4169,6 +4420,10 @@ static int dsi_display_res_init(struct dsi_display *display)
 		phy->cfg.phy_type =
 			display->panel->host_config.phy_type;
 	}
+
+	if (display->boot_disp->boot_disp_en)
+		display->panel->spec_pdata->display_onoff_state = true;
+	dsi_panel_driver_oled_short_det_init_works(display);
 
 	rc = dsi_display_parse_lane_map(display);
 	if (rc) {
@@ -4625,7 +4880,6 @@ static int _dsi_display_dyn_update_clks(struct dsi_display *display,
 		dsi_phy_dynamic_refresh_clear(ctrl->phy);
 	}
 
-defer_dfps_wait:
 	rc = dsi_clk_update_parent(enable_clk,
 			&display->clock_info.mux_clks);
 	if (rc)
@@ -4657,7 +4911,20 @@ recover_byte_clk:
 exit:
 	dsi_clk_disable_unprepare(&display->clock_info.src_clks);
 
+defer_dfps_wait:
 	return rc;
+}
+
+void dsi_display_dfps_update_parent(struct dsi_display *display)
+{
+	int rc = 0;
+
+	rc = dsi_clk_update_parent(&display->clock_info.src_clks,
+			      &display->clock_info.mux_clks);
+	if (rc)
+		DSI_ERR("could not switch back to src clks %d\n", rc);
+
+	dsi_clk_disable_unprepare(&display->clock_info.src_clks);
 }
 
 static int dsi_display_dynamic_clk_switch_vid(struct dsi_display *display,
@@ -5467,6 +5734,492 @@ static int dsi_display_pre_acquire(void *data)
 	return 0;
 }
 
+// Add for HBM tuning Start
+static ssize_t dsi_display_hbm_show(struct device *dev,
+        struct device_attribute *attr, char *buf)
+{
+    struct dsi_display *dsi_display;
+    struct platform_device *pdev = to_platform_device(dev);
+
+    if (!dev || !pdev) {
+        DSI_ERR("%s: invalid param(s)\n", __func__);
+        return -EINVAL;
+    }
+    dsi_display = platform_get_drvdata(pdev);
+    if (dsi_display == NULL || dsi_display->panel == NULL) {
+        DSI_ERR("%s: invalid display\n", __func__);
+        return -EIO;
+    }
+    return scnprintf(buf, PAGE_SIZE, "%d\n", dsi_display->panel->spec_pdata->hbm_mode);
+}
+
+
+static ssize_t dsi_display_hbm_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *dsi_display;
+	struct dsi_panel *panel;
+	struct platform_device *pdev = to_platform_device(dev);
+	unsigned int mode = 0;
+
+	if (!dev || !pdev) {
+		DSI_ERR("%s: invalid param(s)\n", __func__);
+		return -EINVAL;
+	}
+	dsi_display = platform_get_drvdata(pdev);
+	if (dsi_display == NULL || dsi_display->panel == NULL) {
+		DSI_ERR("%s: invalid display\n", __func__);
+		return -EIO;
+	}
+	panel = dsi_display->panel;
+
+        if (!panel->spec_pdata->display_onoff_state) {
+                pr_err("%s: Display is off, can't set HBM status\n", __func__);
+                return -EINVAL;
+        }
+
+	if (kstrtouint(buf, 0, &mode)) {
+		DSI_ERR("%s: failed to convert when write hbm_en.\n", __func__);
+		return -EFAULT;
+	}
+	if (mode < 0 || mode > 1) {
+		DSI_ERR("%s: invalid mode when write hbm_en %u.\n", __func__,  mode);
+		return -EINVAL;
+	}
+	dsi_panel_set_hbm(panel, mode);
+	return count;
+}
+// Add for HBM tuning End
+
+int dsi_panel_tx_cmd(struct dsi_panel *panel,
+				struct dsi_cmd_desc *cmds)
+{
+	int rc = 0;
+	ssize_t len;
+	const struct mipi_dsi_host_ops *ops = panel->host->ops;
+
+	cmds->msg.flags |= MIPI_DSI_MSG_USE_LPM;
+
+	len = ops->transfer(panel->host, &cmds->msg);
+	if (len < 0) {
+		rc = len;
+		pr_err("failed to transfer cmds, rc=%d\n", rc);
+		goto error;
+	}
+	if (cmds->post_wait_ms)
+		msleep(cmds->post_wait_ms);
+error:
+	return rc;
+}
+
+int dsi_panel_rx_cmd(struct dsi_display *display, struct dsi_cmd_desc *cmds,
+				struct dsi_display_ctrl *ctrl, char *rbuf,
+				int len)
+{
+	int rc = 0;
+	ssize_t reslen;
+	int flags = 0;
+
+	dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_ALL_CLKS, DSI_CLK_ON);
+
+	rc = dsi_display_cmd_engine_enable(display);
+	if (rc) {
+		pr_err("cmd engine enable failed\n");
+		return -EPERM;
+	}
+	flags = (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
+	cmds->msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+	cmds->msg.rx_buf = rbuf;
+	cmds->msg.rx_len = len;
+	pr_debug("%s: tx = %x\n", __func__, *(char *)(cmds->msg.tx_buf));
+	reslen = dsi_ctrl_cmd_transfer(ctrl->ctrl, &(cmds->msg), &flags);
+
+	if (reslen < 0) {
+		rc = reslen;
+		pr_err("%s: failed to transfer cmds, rc=%d\n", __func__, rc);
+		goto error;
+	}
+	if (cmds->post_wait_ms)
+		msleep(cmds->post_wait_ms);
+
+	pr_debug("%s: rx = %x\n", __func__, *(char *)(cmds->msg.rx_buf));
+	pr_debug("%s: flags = %d, post_wait_ms = %d, rbuf = %x\n", __func__,
+		cmds->msg.flags, cmds->post_wait_ms, *rbuf);
+
+	dsi_display_cmd_engine_disable(display);
+
+	dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_ALL_CLKS, DSI_CLK_OFF);
+
+error:
+	return rc;
+}
+
+// Add for Reg read Start
+static void update_res_buf(char *string)
+{
+	res_buf = krealloc(res_buf, buf_sz + strnlen(string, TMP_BUF_SZ) + 1,
+								GFP_KERNEL);
+	if (!res_buf) {
+		pr_err("%s: Failed to allocate buffer\n", __func__);
+		return;
+	}
+
+	memcpy(res_buf + buf_sz, string, strnlen(string, TMP_BUF_SZ) + 1);
+	buf_sz += strnlen(string, TMP_BUF_SZ); /* Exclude NULL termination */
+}
+
+static void reset_res_buf(void)
+{
+	kzfree(res_buf);
+	res_buf = NULL;
+	buf_sz = 0;
+}
+
+static int get_parameters(const char *p, u8 *par_buf, int par_buf_size,
+								int *nbr_params)
+{
+	int ret = 0;
+
+	while (true) {
+		if (isspace(*p)) {
+			p++;
+		} else {
+			if (sscanf(p, "%4hhx", &par_buf[*nbr_params]) == 1) {
+				(*nbr_params)++;
+				while (isxdigit(*p) || (*p == 'x'))
+					p++;
+			}
+		}
+		if (*nbr_params > par_buf_size) {
+			update_res_buf("Too many parameters\n");
+			ret = -EINVAL;
+			goto exit;
+		}
+		if (iscntrl(*p))
+			break;
+	}
+exit:
+	return ret;
+}
+
+static int get_cmd_type(char *buf, enum dbg_cmd_type *cmd)
+{
+	int ret = 0;
+
+	if (!strncmp(buf, "dcs", 3))
+		*cmd = DCS;
+	else if (!strncmp(buf, "gen", 3))
+		*cmd = GEN;
+	else
+		ret = -EFAULT;
+	return ret;
+}
+
+static void print_params(int dtype, u8 reg, int len, u8 *data)
+{
+	int i = 0;
+	char tmp[TMP_BUF_SZ];
+
+	switch (dtype) {
+	case DTYPE_GEN_WRITE:
+		update_res_buf("GEN_WRITE\n");
+		break;
+	case DTYPE_GEN_WRITE1:
+		update_res_buf("GEN_WRITE1\n");
+		break;
+	case DTYPE_GEN_WRITE2:
+		update_res_buf("GEN_WRITE2\n");
+		break;
+	case DTYPE_GEN_LWRITE:
+		update_res_buf("GEN_LWRITE\n");
+		break;
+	case DTYPE_GEN_READ:
+		update_res_buf("GEN_READ\n");
+		break;
+	case DTYPE_GEN_READ1:
+		update_res_buf("GEN_READ1\n");
+		break;
+	case DTYPE_GEN_READ2:
+		update_res_buf("GEN_READ2\n");
+		break;
+	case DTYPE_DCS_LWRITE:
+		update_res_buf("DCS_LWRITE\n");
+		break;
+	case DTYPE_DCS_WRITE:
+		update_res_buf("DCS_WRITE\n");
+		break;
+	case DTYPE_DCS_WRITE1:
+		update_res_buf("DCS_WRITE1\n");
+		break;
+	case DTYPE_DCS_READ:
+		update_res_buf("DCS_READ\n");
+		break;
+	default:
+		snprintf(tmp, sizeof(tmp), "Unknown dtype = 0x%x\n", dtype);
+		update_res_buf(tmp);
+	}
+
+	if (len > 0) {
+		snprintf(tmp, sizeof(tmp), "reg=0x%.2X\n", reg);
+		update_res_buf(tmp);
+		snprintf(tmp, sizeof(tmp), "len=%d\n", len);
+		update_res_buf(tmp);
+		for (i = 0; i < len; i++) {
+			snprintf(tmp, sizeof(tmp), "data[%d]=0x%.2X\n", i,
+								data[i]);
+			update_res_buf(tmp);
+		}
+	} else {
+		update_res_buf("Something went wrong, length is zero.\n");
+		snprintf(tmp, sizeof(tmp),
+				"reg=0x%.2X, len=%d, data[0]=0x%.2X\n",
+				reg, len, data[0]);
+		update_res_buf(tmp);
+	}
+}
+
+static ssize_t dsi_display_driver_reg_read_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display = dev_get_drvdata(dev);
+	struct dsi_cmd_desc dsi;
+	struct dsi_display_ctrl *m_ctrl;
+	u8 data[3]; /* No more than reg + two parameters is allowed */
+	int i = 0;
+	int j = 0;
+	int ret;
+	char *rbuf;
+	int nbr_bytes_to_read;
+	int size_rbuf = 0;
+	const char *p;
+
+	enum dbg_cmd_type cmd;
+
+	if (!display->panel->spec_pdata->display_onoff_state) {
+		pr_err("%s: panel is NOT on\n", __func__);
+		goto fail_free_all;
+	}
+
+	m_ctrl = &display->ctrl[display->cmd_master_idx];
+
+	reset_res_buf();
+
+	ret = get_cmd_type((char *)buf, &cmd);
+	if (ret) {
+		update_res_buf("Read - unknown type\n");
+		goto fail_free_all;
+	}
+
+	p = buf;
+	p = p+4;
+
+	/* Get nbr_bytes_to_read */
+	if (sscanf(p, "%d", &nbr_bytes_to_read) != 1) {
+		update_res_buf("Read - parameter error\n");
+		goto fail_free_all;
+	}
+
+	while (isxdigit(*p) || (*p == 'x'))
+		p++;
+
+	ret = get_parameters(p, data, ARRAY_SIZE(data), &i);
+	if (ret)
+		goto fail_free_all;
+
+	if (cmd == DCS) {
+		dsi.msg.type = DTYPE_DCS_READ;
+	} else {
+		if (i == 1) {
+			dsi.msg.type = DTYPE_GEN_READ1;
+		} else {
+			dsi.msg.type = DTYPE_GEN_READ2;
+		}
+	}
+
+	dsi.last_command = true;
+	dsi.msg.channel = 0;
+	dsi.msg.flags = 0;
+	dsi.msg.ctrl = 0;
+	dsi.post_wait_ms = 5;
+	dsi.msg.tx_len = i;
+	dsi.msg.tx_buf = data;
+	dsi.msg.wait_ms = 0;
+
+	for (j = 0; j < i; j++)
+		pr_debug("%s: tx_buf[%d] = 0x%x\n", __func__, j,
+			(*((data)+(sizeof(u8)) * j)));
+
+	if (nbr_bytes_to_read <= 2)
+		size_rbuf = 4;
+	else
+		size_rbuf = nbr_bytes_to_read + 13;
+
+	rbuf = kcalloc(size_rbuf, sizeof(char), GFP_KERNEL);
+	if (!rbuf)
+		goto fail_free_all;
+
+	dsi_panel_rx_cmd(display, &dsi, m_ctrl, rbuf, nbr_bytes_to_read);
+
+	print_params(dsi.msg.type, data[0], nbr_bytes_to_read, (u8 *)rbuf);
+
+	if (rbuf)
+		kzfree(rbuf);
+fail_free_all:
+	return count;
+}
+
+static ssize_t dsi_display_driver_reg_read_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", res_buf);
+}
+// Add for Reg read End
+
+// Add for Reg Write Start
+static ssize_t dsi_display_driver_reg_write_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display = dev_get_drvdata(dev);
+	const char *p;
+	enum dbg_cmd_type cmd;
+	u8 data[MAX_WRITE_DATA];
+	int i = 0;
+	int ret;
+	struct dsi_cmd_desc dsi;
+
+	if (!display->panel->spec_pdata->display_onoff_state) {
+		pr_err("%s: panel is NOT on\n", __func__);
+		goto fail_free_all;
+	}
+
+	reset_res_buf();
+
+	ret = get_cmd_type((char *)buf, &cmd);
+	if (ret) {
+		update_res_buf("Write - unknown type\n");
+		goto fail_free_all;
+	}
+
+	p = buf;
+	p = p+4;
+
+	/* Get first param, Register */
+	if (sscanf(p, "%4hhx", &data[0]) != 1) {
+		update_res_buf("Write - parameter error\n");
+		goto fail_free_all;
+	}
+	i++;
+
+	while (isxdigit(*p) || (*p == 'x'))
+		p++;
+
+	ret = get_parameters(p, data, ARRAY_SIZE(data) - 1, &i);
+	if (ret)
+		goto fail_free_all;
+
+	if (cmd == DCS) {
+		if (i == 1) {
+			dsi.msg.type = DTYPE_DCS_WRITE;;
+		} else if (i == 2) {
+			dsi.msg.type = DTYPE_DCS_WRITE1;
+		} else {
+			dsi.msg.type = DTYPE_DCS_LWRITE;
+		}
+	} else {
+		if (i == 1) {
+			dsi.msg.type = DTYPE_GEN_WRITE1;
+		} else if (i == 2) {
+			dsi.msg.type = DTYPE_GEN_WRITE2;
+		} else {
+			dsi.msg.type = DTYPE_GEN_LWRITE;
+		}
+	}
+
+	dsi.last_command = true;
+	dsi.msg.channel = 0;
+	dsi.msg.flags = 0;
+	dsi.msg.ctrl = 0;
+	dsi.post_wait_ms = 0;
+	dsi.msg.tx_len = i;
+	dsi.msg.tx_buf = data;
+
+	pr_debug("%s: last = %d, vc = %d, ack = %d, wait = %d, dlen = %zd\n",
+		__func__,
+		dsi.last_command, dsi.msg.channel, dsi.msg.flags, dsi.post_wait_ms,
+		dsi.msg.tx_len);
+
+	dsi_panel_tx_cmd(display->panel, &dsi);
+
+	print_params(dsi.msg.type, data[0], i, (u8 *)dsi.msg.tx_buf);
+
+fail_free_all:
+	pr_err("END\n");
+	return count;
+}
+
+static ssize_t dsi_panel_driver_reg_write_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", res_buf);
+}
+// Add for Reg Write End
+
+static struct device_attribute panel_attributes[] = {
+	__ATTR(hbm_mode, S_IRUGO | S_IWUSR, dsi_display_hbm_show, dsi_display_hbm_store),
+	__ATTR(panel_reg_read,  S_IRUSR|S_IRGRP|S_IWUSR|S_IWGRP, dsi_display_driver_reg_read_show, dsi_display_driver_reg_read_store),
+	__ATTR(panel_reg_write,  S_IRUSR|S_IRGRP|S_IWUSR|S_IWGRP, dsi_panel_driver_reg_write_show, dsi_display_driver_reg_write_store),
+};
+
+int dsi_display_register_attributes(struct device *dev)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(panel_attributes); i++){
+		if (device_create_file(dev, panel_attributes + i)){
+			goto error;
+		}
+	}
+	return 0;
+
+error:
+	dev_err(dev, "%s: Unable to create interface\n", __func__);
+
+	for (--i; i >= 0 ; i--)
+		device_remove_file(dev, panel_attributes + i);
+	return -ENODEV;
+}
+
+int dsi_display_create_fs(struct dsi_display *display)
+{
+	int rc = 0;
+	char *path_name = "dsi_panel_driver";
+
+	dev_set_name(&virtdev, "%s", path_name);
+	rc = device_register(&virtdev);
+	if (rc) {
+		pr_err("%s: device_register rc = %d\n", __func__, rc);
+		goto err;
+	}
+
+	rc = dsi_panel_register_attributes(&virtdev);
+	if (rc) {
+		device_unregister(&virtdev);
+		goto err;
+	}
+
+	rc = dsi_display_register_attributes(&virtdev);
+	if (rc) {
+		device_unregister(&virtdev);
+		goto err;
+	}
+	dev_set_drvdata(&virtdev, display);
+err:
+	return rc;
+}
+//Add for HBM tuning End
+
 /**
  * dsi_display_bind - bind dsi device with controlling device
  * @dev:        Pointer to base of platform device
@@ -5653,6 +6406,12 @@ static int dsi_display_bind(struct device *dev,
 		goto error_host_deinit;
 	}
 
+	rc = dsi_display_create_fs(display);
+	if (rc) {
+		pr_err("%s: failed dsi_display_create_fs rc=%d\n", __func__, rc);
+		goto error_host_deinit;
+	}
+
 	DSI_INFO("Successfully bind display panel '%s'\n", display->name);
 	display->drm_dev = drm;
 
@@ -5689,6 +6448,8 @@ error_ctrl_deinit:
 		display_ctrl = &display->ctrl[i];
 		(void)dsi_phy_drv_deinit(display_ctrl->phy);
 		(void)dsi_ctrl_drv_deinit(display_ctrl->ctrl);
+		dsi_ctrl_put(display_ctrl->ctrl);
+		dsi_phy_put(display_ctrl->phy);
 	}
 	(void)dsi_display_debugfs_deinit(display);
 error:
@@ -5797,6 +6558,8 @@ static int dsi_display_init(struct dsi_display *display)
 			return rc;
 		}
 	}
+
+	dsi_panel_driver_init_area_count(display->panel);
 
 	rc = component_add(&pdev->dev, &dsi_display_comp_ops);
 	if (rc)
@@ -5911,7 +6674,10 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, display);
 
 	/* initialize display in firmware callback */
-	if (0) {
+	if (!(boot_displays[DSI_PRIMARY].boot_disp_en ||
+			boot_displays[DSI_SECONDARY].boot_disp_en) &&
+			IS_ENABLED(CONFIG_DSI_PARSER) &&
+			!display->trusted_vm_env) {
 		if (!strcmp(display->display_type, "primary"))
 			firm_req = !request_firmware_nowait(
 				THIS_MODULE, 1, "dsi_prop",
@@ -5930,6 +6696,8 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 		if (rc)
 			goto end;
 	}
+
+	dsi_panel_driver_oled_short_det_init_works(display);
 
 	return 0;
 end:
@@ -5966,6 +6734,8 @@ int dsi_display_dev_remove(struct platform_device *pdev)
 			ctrl->ctrl->dma_cmd_workq = NULL;
 		}
 	}
+
+	dsi_panel_driver_deinit_area_count(display->panel);
 
 	(void)_dsi_display_dev_deinit(display);
 
@@ -6054,6 +6824,12 @@ int dsi_display_drm_bridge_init(struct dsi_display *display,
 
 	display->bridge = bridge;
 	priv->bridges[priv->num_bridges++] = &bridge->base;
+
+	if (display->tx_cmd_buf == NULL) {
+		rc = dsi_host_alloc_cmd_tx_buffer(display);
+		if (rc)
+			DSI_ERR("failed to allocate cmd tx buffer memory\n");
+	}
 
 error:
 	mutex_unlock(&display->display_lock);
@@ -6854,6 +7630,20 @@ int dsi_display_get_modes(struct dsi_display *display,
 			DSI_ERR("[%s] failed to get mode idx %d from panel\n",
 				   display->name, mode_idx);
 			goto error;
+		}
+
+		/*
+		 * Update the host_config.dst_format for compressed RGB101010
+		 * pixel format.
+		 */
+		if (display->panel->host_config.dst_format ==
+			DSI_PIXEL_FORMAT_RGB101010 &&
+			display_mode.timing.dsc_enabled) {
+			display->panel->host_config.dst_format =
+				DSI_PIXEL_FORMAT_RGB888;
+			DSI_DEBUG("updated dst_format from %d to %d\n",
+				DSI_PIXEL_FORMAT_RGB101010,
+				display->panel->host_config.dst_format);
 		}
 
 		is_cmd_mode = (display_mode.panel_mode == DSI_OP_CMD_MODE);
@@ -8522,6 +9312,12 @@ int dsi_display_unprepare(struct dsi_display *display)
 			DSI_LINK_CLK, DSI_CLK_OFF);
 	if (rc)
 		DSI_ERR("[%s] failed to disable Link clocks, rc=%d\n",
+		       display->name, rc);
+
+	/* set to dsi clocks to xo clocks */
+	rc = dsi_display_unset_clk_src(display);
+	if (rc)
+		DSI_ERR("[%s] failed to unset clocks, rc=%d\n",
 		       display->name, rc);
 
 	rc = dsi_display_ctrl_deinit(display);

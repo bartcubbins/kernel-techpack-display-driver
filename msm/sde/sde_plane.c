@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2014-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (C) 2014-2021 The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -123,6 +124,7 @@ struct sde_plane {
 	struct sde_csc_cfg *csc_usr_ptr;
 	struct sde_csc_cfg *csc_ptr;
 
+	uint32_t cached_lut_flag;
 	struct sde_hw_scaler3_cfg scaler3_cfg;
 	struct sde_hw_pixel_ext pixel_ext;
 
@@ -1961,6 +1963,39 @@ static void sde_plane_cleanup_fb(struct drm_plane *plane,
 
 }
 
+static int _sde_plane_validate_fb(struct sde_plane *psde,
+				struct drm_plane_state *state)
+{
+	struct sde_plane_state *pstate;
+	struct drm_framebuffer *fb;
+	uint32_t fb_ns = 0, fb_sec = 0, fb_sec_dir = 0;
+	unsigned long flags = 0;
+	int mode, ret = 0, n, i;
+
+	pstate = to_sde_plane_state(state);
+	mode = sde_plane_get_property(pstate,
+				PLANE_PROP_FB_TRANSLATION_MODE);
+
+	fb = state->fb;
+	n = fb->format->num_planes;
+	for (i = 0; i < n; i++) {
+		ret = msm_fb_obj_get_attrs(fb->obj[i], &fb_ns, &fb_sec,
+			&fb_sec_dir, &flags);
+
+		if (!ret && ((fb_ns && (mode != SDE_DRM_FB_NON_SEC)) ||
+			(fb_sec && (mode != SDE_DRM_FB_SEC)) ||
+			(fb_sec_dir && (mode != SDE_DRM_FB_SEC_DIR_TRANS)))) {
+			SDE_ERROR_PLANE(psde, "mode:%d fb:%d dma_buf flags:0x%x rc:%d\n",
+			mode, fb->base.id, flags, ret);
+			SDE_EVT32(psde->base.base.id, fb->base.id, flags,
+			fb_ns, fb_sec, fb_sec_dir, ret, SDE_EVTLOG_ERROR);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static void _sde_plane_sspp_atomic_check_mode_changed(struct sde_plane *psde,
 		struct drm_plane_state *state,
 		struct drm_plane_state *old_state)
@@ -2633,6 +2668,11 @@ static int sde_plane_sspp_atomic_check(struct drm_plane *plane,
 	if (ret)
 		return ret;
 
+	ret = _sde_plane_validate_fb(psde, state);
+
+	if (ret)
+		return ret;
+
 	pstate->const_alpha_en = fmt->alpha_enable &&
 		(SDE_DRM_BLEND_OP_OPAQUE !=
 		 sde_plane_get_property(pstate, PLANE_PROP_BLEND_OP)) &&
@@ -3178,6 +3218,21 @@ static void _sde_plane_update_properties(struct drm_plane *plane,
 	pstate->dirty = 0x0;
 }
 
+static void _sde_plane_check_lut_dirty(struct sde_plane *psde,
+			struct sde_plane_state *pstate)
+{
+	/**
+	 * Valid configuration if scaler is not enabled or
+	 * lut flag is set
+	 */
+	if (pstate->scaler3_cfg.lut_flag || !pstate->scaler3_cfg.enable)
+		return;
+
+	pstate->scaler3_cfg.lut_flag = psde->cached_lut_flag;
+	SDE_EVT32(DRMID(&psde->base), pstate->scaler3_cfg.lut_flag,
+		SDE_EVTLOG_ERROR);
+}
+
 static int sde_plane_sspp_atomic_update(struct drm_plane *plane,
 				struct drm_plane_state *old_state)
 {
@@ -3229,10 +3284,16 @@ static int sde_plane_sspp_atomic_update(struct drm_plane *plane,
 			state->crtc_w, state->crtc_h,
 			state->crtc_x, state->crtc_y);
 
+	/* Caching the valid lut flag in sde plane */
+	if (pstate->scaler3_cfg.enable &&
+			pstate->scaler3_cfg.lut_flag)
+		psde->cached_lut_flag = pstate->scaler3_cfg.lut_flag;
+
 	/* force reprogramming of all the parameters, if the flag is set */
 	if (psde->revalidate) {
 		SDE_DEBUG("plane:%d - reconfigure all the parameters\n",
 				plane->base.id);
+		_sde_plane_check_lut_dirty(psde, pstate);
 		pstate->dirty = SDE_PLANE_DIRTY_ALL | SDE_PLANE_DIRTY_CP;
 		psde->revalidate = false;
 	}
@@ -3604,7 +3665,7 @@ static void _sde_plane_setup_capabilities_blob(struct sde_plane *psde,
 	sde_kms_info_add_keyint(info, "pipe_idx", pipe_id);
 
 	index = (master_plane_id == 0) ? 0 : 1;
-	if (catalog->has_demura &&
+	if (catalog->has_demura && psde->pipe < SSPP_MAX &&
 	    catalog->demura_supported[psde->pipe][index] != ~0x0)
 		sde_kms_info_add_keyint(info, "demura_block", index);
 
@@ -3694,7 +3755,7 @@ static void _sde_plane_install_properties(struct drm_plane *plane,
 	psde->catalog = catalog;
 	is_master = !psde->is_virtual;
 
-	info = kzalloc(sizeof(struct sde_kms_info), GFP_KERNEL);
+	info = vzalloc(sizeof(struct sde_kms_info));
 	if (!info) {
 		SDE_ERROR("failed to allocate info memory\n");
 		return;
@@ -3773,7 +3834,7 @@ static void _sde_plane_install_properties(struct drm_plane *plane,
 			ARRAY_SIZE(e_fb_translation_mode), 0,
 			PLANE_PROP_FB_TRANSLATION_MODE);
 
-	kfree(info);
+	vfree(info);
 }
 
 static inline void _sde_plane_set_csc_v1(struct sde_plane *psde,
