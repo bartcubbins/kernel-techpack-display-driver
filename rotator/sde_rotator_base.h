@@ -47,7 +47,7 @@
 #define SDE_MDP_HW_REV_540	SDE_MDP_REV(5, 4, 0)	/* sdmtrinket v1.0 */
 #define SDE_MDP_HW_REV_600	SDE_MDP_REV(6, 0, 0)    /* msmnile+ v1.0 */
 #define SDE_MDP_HW_REV_630	SDE_MDP_REV(6, 3, 0)	/* bengal v1.0 */
-#define SDE_MDP_HW_REV_660	SDE_MDP_REV(6, 6, 0)	/* holi */
+#define SDE_MDP_HW_REV_660	SDE_MDP_REV(6, 9, 0)	/* holi */
 #define SDE_MDP_HW_REV_860	SDE_MDP_REV(8, 6, 0)	/* Ravelin */
 
 #define SDE_MDP_VBIF_4_LEVEL_REMAPPER	4

@@ -50,6 +50,9 @@ ifeq ($(CONFIG_ARCH_ANORAK), y)
 	LINUX_INC +=	-include $(DISPLAY_ROOT)/config/gki_anorakdispconf.h
 endif
 
+include $(DISPLAY_ROOT)/config/gki_holidisp.conf
+	LINUX_INC +=	-include $(DISPLAY_ROOT)/config/gki_holidispconf.h
+
 LINUX_INC +=	-Iinclude/linux \
 		-Iinclude/linux/drm
 
@@ -96,7 +99,7 @@ CDEFINES += -DMULTI_IF_NAME=\"$(CHIP_NAME)\"
 endif
 
 ######### CONFIG_DRM_MSM ########
-obj-$(CONFIG_DRM_MSM) += msm_drm.o
+obj-y += msm_drm.o
 
 msm_drm-$(CONFIG_HDCP_QSEECOM) := ../hdcp/msm_hdcp.o
 
@@ -249,3 +252,6 @@ msm_drm-$(CONFIG_DRM_MSM) += msm_atomic.o \
 			     msm_gem_vma.o \
 			     msm_smmu.o \
 			     msm_prop.o
+
+CDEFINES += -DBUILD_TIMESTAMP=\"$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')\"
+
